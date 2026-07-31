@@ -14,8 +14,7 @@ FROM nginx:1.27-alpine
 
 COPY --from=web-build /app/web/dist /usr/share/nginx/html
 # 👇 新加这一行：用 staticrypt 加密 index.html，密码从环境变量读取
-RUN apk add --no-cache nodejs npm && npm install -g staticrypt && staticrypt /usr/share/nginx/html/index.html -p 你的密码 -o /usr/share/nginx/html/index.html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
+RUN apk add --no-cache nodejs npm && npm install -g staticrypt && staticrypt /usr/share/nginx/html/index.html -p $SITE_PASS -o /usr/share/nginx/html/index.htmlCOPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY web/docker-entrypoint.sh /docker-entrypoint.d/40-runtime-config.sh
 RUN chmod +x /docker-entrypoint.d/40-runtime-config.sh
 

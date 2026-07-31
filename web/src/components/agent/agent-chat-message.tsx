@@ -23,6 +23,7 @@ const streamdownProps = {
         openLink: "继续打开",
     },
 } as const;
+const streamdownAnimation = { duration: 20, stagger: 0, sep: "word" } as const;
 
 function AgentLinkModal({ isOpen, onClose, onConfirm, url }: LinkSafetyModalProps) {
     const { message } = App.useApp();
@@ -127,7 +128,7 @@ export function AgentChatMessage({ item, theme, onRejectTool, onApproveTool }: {
                 {isUser ? (
                     <div className="whitespace-pre-wrap break-words">{item.text}</div>
                 ) : (
-                    <Streamdown {...streamdownProps} animated isAnimating={!!item.streamId}>{item.text}</Streamdown>
+                    <Streamdown {...streamdownProps} animated={streamdownAnimation} isAnimating={!!item.streamId}>{item.text}</Streamdown>
                 )}
                 {item.attachments?.length ? <AgentMessageAttachments attachments={item.attachments} alignRight={isUser} /> : null}
                 {item.meta ? <div className={`mt-1 text-[11px] tabular-nums opacity-55 ${isUser ? "text-right" : ""}`}>{item.meta}</div> : null}
@@ -197,6 +198,7 @@ export function AgentToolCard({ title, text, detail, theme }: { title: string; t
     if (kind === "command") return <AgentCommandSummary text={text} detail={detail} theme={theme} />;
     const state = toolCardState(title, text, detail);
     const view = userDetail(detail);
+    const showText = title !== "读取画布" || text !== "已读取当前画布内容";
     return (
         <details className="group min-w-0 rounded-xl border px-3 py-2.5 text-left" style={{ borderColor: theme.node.stroke, background: "transparent", color: theme.node.text }}>
             <summary className={`list-none ${view ? "cursor-pointer" : "cursor-default"}`} onClick={(event) => { if (!view) event.preventDefault(); }}>
@@ -206,9 +208,11 @@ export function AgentToolCard({ title, text, detail, theme }: { title: string; t
                     <span className="shrink-0 text-[11px]" style={{ color: state.color }}>{state.label}</span>
                     {view ? <ChevronDown className="ml-auto size-3.5 shrink-0 transition-transform group-open:rotate-180" style={{ color: theme.node.muted }} /> : null}
                 </div>
-                <div className={`mt-1 whitespace-pre-wrap break-words pl-6 text-sm leading-5 ${kind === "command" ? "font-mono text-[12px]" : ""}`} style={{ color: state.isError ? state.color : theme.node.muted }}>
-                    {text}
-                </div>
+                {showText ? (
+                    <div className={`mt-1 whitespace-pre-wrap break-words pl-6 text-sm leading-5 ${kind === "command" ? "font-mono text-[12px]" : ""}`} style={{ color: state.isError ? state.color : theme.node.muted }}>
+                        {text}
+                    </div>
+                ) : null}
             </summary>
             {view ? <div className="ml-6"><AgentDetailBlock detail={view} theme={theme} /></div> : null}
         </details>
@@ -228,7 +232,7 @@ function AgentReasoningSummary({ text, detail, theme }: { text: string; detail?:
                 </div>
             </summary>
             <div className="break-words pb-1 pl-6 pr-2 text-xs leading-5 [&_code]:rounded [&_code]:px-1 [&_p]:my-1 [&_pre]:my-2" style={{ color: theme.node.muted }}>
-                <Streamdown {...streamdownProps} animated isAnimating={running}>{text}</Streamdown>
+                <Streamdown {...streamdownProps} animated={streamdownAnimation} isAnimating={running}>{text}</Streamdown>
             </div>
         </details>
     );

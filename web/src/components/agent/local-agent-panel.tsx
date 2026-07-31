@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { App, Button, Tooltip } from "antd";
+import dayjs from "dayjs";
 import { Bot, History, MessageSquare, PanelRightClose, PlugZap, Plus, Terminal } from "lucide-react";
 
 import { canvasThemes } from "@/lib/canvas-theme";
@@ -12,7 +13,7 @@ import { uploadImage } from "@/services/image-storage";
 import { deleteAgentThreadMessages, readAgentUserMessages, saveAgentUserMessage } from "@/services/agent-chat-storage";
 import { useThemeStore } from "@/stores/use-theme-store";
 import { useShallow } from "zustand/react/shallow";
-import { useAgentStore, type AgentCanvasContext, type AgentChatItem, type AgentPendingApproval, type AgentPendingToolCall, type AgentPermissionMode, type AgentThreadSummary } from "@/stores/use-agent-store";
+import { useAgentStore, type AgentCanvasContext, type AgentChatItem, type AgentModel, type AgentPendingApproval, type AgentPendingToolCall, type AgentPermissionMode, type AgentReasoningEffort, type AgentThreadSummary } from "@/stores/use-agent-store";
 import { summarizeCanvasAgentOps, type CanvasAgentOp, type CanvasAgentSnapshot } from "@/lib/canvas/canvas-agent-ops";
 import { isSiteTool, runSiteTool } from "@/lib/agent/agent-site-tools";
 import { activateAgentClient, discoverAgentConfig, fetchAgentJson, postCodexApproval, postState, postToolResult } from "./agent-api";
@@ -60,13 +61,16 @@ import { AgentPanelTabs } from "./agent-panel-tabs";
 const MAX_ATTACHMENTS = 6;
 const MAX_ATTACHMENT_PAYLOAD_BYTES = 28 * 1024 * 1024;
 const DEFAULT_AGENT_URL = "http://127.0.0.1:17371";
+const AGENT_REASONING_EFFORTS = new Set<AgentReasoningEffort>(["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
+const AGENT_REASONING_LABELS: Record<AgentReasoningEffort, string> = { minimal: "最低", low: "轻度", medium: "中", high: "高", xhigh: "极高", max: "最高", ultra: "Ultra" };
 
 type AgentWorkspace = { workspacePath: string; activeThreadId?: string };
 type AgentThreadsResponse = { ok?: boolean; workspace?: AgentWorkspace; data?: AgentThreadSummary[] };
 type AgentThreadResponse = { ok?: boolean; workspace?: AgentWorkspace; thread?: AgentThreadSummary; messages?: AgentChatItem[] };
+type AgentModelsResponse = { ok?: boolean; data?: AgentModel[] };
 type AgentCodexState = { busy?: boolean; threadId?: string; turnId?: string };
 type AgentHelloEvent = { ok?: boolean; clientId?: string; codex?: AgentCodexState };
-type AgentWorkspaceEvent = { activeThreadId?: string; threadId?: string; emptyThread?: boolean };
+type AgentWorkspaceEvent = { activeThreadId?: string; threadId?: string; emptyThread?: boolean; draftThread?: boolean };
 type AgentChatEvent = { threadId?: string; sourceClientId?: string; message?: AgentChatItem };
 
 export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?: boolean; headless?: boolean; autoConnect?: boolean }) {
@@ -78,7 +82,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     // 注意：canvasContext 不在此订阅内 —— 它在拖拽/resize 时会被 project 每帧写入，
     // 但面板只在 ref 同步与防抖 postState 中用到它、渲染层从不读它。若把它放进订阅，
     // 面板会随画布每帧重渲染（性能问题，也是 #185 崩溃的放大器）。改为下方 subscribe 命令式监听。
-    const { width, url, token, connected, enabled, prompt, attachments, sending, waiting, tokenUsage, eventLogs, threads, activeThreadId, workspacePath, loadingThreads, activeTab, confirmTools, permissionMode, activity, connectError, pendingTool, pendingApprovals } = useAgentStore(
+    const { width, url, token, connected, enabled, prompt, attachments, sending, waiting, tokenUsage, eventLogs, threads, activeThreadId, workspacePath, loadingThreads, activeTab, confirmTools, permissionMode, models, model, reasoningEffort, activity, connectError, pendingTool, pendingApprovals } = useAgentStore(
         useShallow((state) => ({
             width: state.width,
             url: state.url,
@@ -98,6 +102,9 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             activeTab: state.activeTab,
             confirmTools: state.confirmTools,
             permissionMode: state.permissionMode,
+            models: state.models,
+            model: state.model,
+            reasoningEffort: state.reasoningEffort,
             activity: state.activity,
             connectError: state.connectError,
             pendingTool: state.pendingTool,
@@ -119,6 +126,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
     const attachmentUrlsRef = useRef(new Set<string>());
     const clientIdRef = useRef(randomId());
     const loadThreadsSequenceRef = useRef(0);
+    const resetThreadRef = useRef<Promise<unknown> | null>(null);
     const endpoint = useMemo(() => url.trim().replace(/\/$/, ""), [url]);
     const urlAgentAutoConnect = searchParams.has("agentUrl") && searchParams.has("agentToken");
     const loadThreads = useCallback(async (skipHistory = false) => {
@@ -223,10 +231,10 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             enqueueEvent(async () => {
                 const nextThreadId = data.activeThreadId ?? data.threadId ?? "";
                 const current = useAgentStore.getState();
-                const keepPendingMessage = Boolean(data.emptyThread && current.sending && current.activeThreadId === nextThreadId);
+                const keepPendingMessage = Boolean(data.emptyThread && current.sending && current.messages.some((message) => message.role === "user"));
                 pendingToolRef.current = null;
                 setAgentState({ activeThreadId: nextThreadId, ...(keepPendingMessage ? {} : { messages: [] }), tokenUsage: null, pendingTool: null, pendingApprovals: [] });
-                await loadThreads(Boolean(data.emptyThread));
+                if (!data.draftThread) await loadThreads(Boolean(data.emptyThread));
             });
         });
         source.addEventListener("chat_message", (event) => {
@@ -278,6 +286,30 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
 
     useEffect(() => {
         if (!connected) return;
+        void fetchAgentJson<AgentModelsResponse>(endpoint, token, "/agent/codex/models").then(({ data = [] }) => {
+            const names = new Set<string>();
+            const models = data.flatMap((item) => {
+                const name = item.displayName || item.model;
+                const efforts = item.supportedReasoningEfforts.filter(({ reasoningEffort }) => AGENT_REASONING_EFFORTS.has(reasoningEffort));
+                if (item.model === "codex-auto-review" || names.has(name) || !efforts.length) return [];
+                names.add(name);
+                const defaultReasoningEffort = efforts.some((effort) => effort.reasoningEffort === item.defaultReasoningEffort) ? item.defaultReasoningEffort : efforts[0].reasoningEffort;
+                return [{ ...item, supportedReasoningEfforts: efforts, defaultReasoningEffort }];
+            });
+            if (!models.length) return;
+            const savedModel = useAgentStore.getState().model;
+            const current = models.find((item) => item.model === savedModel) || models.find((item) => item.isDefault) || models[0];
+            const savedEffort = useAgentStore.getState().reasoningEffort;
+            const efforts = current.supportedReasoningEfforts.map((item) => item.reasoningEffort);
+            const nextEffort = efforts.includes(savedEffort as AgentReasoningEffort) ? savedEffort as AgentReasoningEffort : current.defaultReasoningEffort || efforts[0];
+            localStorage.setItem("canvas-agent-model", current.model);
+            localStorage.setItem("canvas-agent-reasoning-effort", nextEffort);
+            setAgentState({ models, model: current.model, reasoningEffort: nextEffort });
+        }).catch((error) => addEventLog("读取模型列表失败", error));
+    }, [connected, endpoint, setAgentState, token]);
+
+    useEffect(() => {
+        if (!connected) return;
         const activate = () => void activateAgentClient(endpoint, token, clientIdRef.current);
         const activateVisible = () => {
             if (document.visibilityState === "visible") activate();
@@ -298,20 +330,23 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
             addMessage({ role: "error", title: "图片过大", text: "图片附件超过 30MB，请删减后再发送。" });
             return;
         }
-        setAgentState({ activity: "发送中", sending: true });
         const messageId = createId();
         const userText = text || `发送了 ${files.length} 张图片`;
+        setAgentState({ prompt: "", attachments: [], activity: "发送中", sending: true });
+        addMessage({ id: messageId, role: "user", text: userText, historyText: requestPrompt, attachments: files });
         let threadId = useAgentStore.getState().activeThreadId;
         try {
+            await resetThreadRef.current;
             if (!threadId) {
                 const created = await fetchAgentJson<AgentThreadResponse>(endpoint, token, "/agent/codex/threads/new", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ permissionMode }) });
                 threadId = created.thread?.id || created.workspace?.activeThreadId || "";
                 if (!threadId) throw new Error("新建对话失败");
-                setAgentState({ activeThreadId: threadId, messages: [], tokenUsage: null });
+                setAgentState({ activeThreadId: threadId, tokenUsage: null });
             }
-            addMessage({ id: messageId, role: "user", text: userText, historyText: requestPrompt, attachments: files });
             if (files.length) void saveAgentUserMessage(threadId, { id: messageId, role: "user", text: userText, historyText: requestPrompt, attachments: files }).catch(() => undefined);
-            addEventLog("发送任务", `${compactText(text) || "仅附件"}${files.length ? ` · 附件 ${files.length}` : ""}`);
+            const modelName = models.find((item) => item.model === model)?.displayName || model || "默认模型";
+            const effortName = reasoningEffort ? AGENT_REASONING_LABELS[reasoningEffort] : "默认强度";
+            addEventLog("发送任务", `${modelName} · ${effortName}${files.length ? ` · 附件 ${files.length}` : ""} · ${compactText(text) || "仅附件"}`);
             const data = await fetchAgentJson<{ threadId?: string }>(endpoint, token, "/agent/codex/turn", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
@@ -322,6 +357,8 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                     clientId: clientIdRef.current,
                     threadId,
                     permissionMode,
+                    model,
+                    effort: reasoningEffort,
                     attachments: files.map(({ id, name, type, size, width, height, dataUrl }) => ({ id, name, type, size, width, height, dataUrl })),
                 }),
             });
@@ -330,11 +367,15 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                 URL.revokeObjectURL(item.url);
                 attachmentUrlsRef.current.delete(item.url);
             });
-            setAgentState({ prompt: "", attachments: [], sending: false, waiting: true, activity: "Codex 正在运行" });
+            setAgentState({ sending: false, waiting: true, activity: "Codex 正在运行" });
         } catch (error) {
             const text = error instanceof Error ? error.message : "发送失败";
             const busy = text.includes("Codex 正在运行");
-            setAgentState({ activity: busy ? "Codex 正在运行" : "发送失败" });
+            const state = useAgentStore.getState();
+            setAgentState({
+                activity: busy ? "Codex 正在运行" : "发送失败",
+                ...(state.prompt || state.attachments.length ? {} : { prompt, attachments: files }),
+            });
             addMessage({ role: "error", title: busy ? "任务仍在运行" : "发送失败", text });
             addEventLog("发送失败", error);
         } finally {
@@ -572,18 +613,19 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         pendingToolRef.current = null;
     }
 
-    const startNewThread = async () => {
+    const startNewThread = () => {
         if (!connected || sending || waiting) return;
-        setAgentState({ loadingThreads: true });
-        try {
-            const data = await fetchAgentJson<AgentThreadResponse>(endpoint, token, "/agent/codex/threads/new", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ permissionMode }) });
-            setAgentState({ activeThreadId: data.thread?.id || data.workspace?.activeThreadId || "", messages: [], tokenUsage: null, activeTab: "chat", activity: "新对话" });
-        } catch (error) {
+        setAgentState({ activeThreadId: "", messages: [], tokenUsage: null, activeTab: "chat", activity: "新对话", pendingTool: null, pendingApprovals: [] });
+        pendingToolRef.current = null;
+        const request = fetchAgentJson(endpoint, token, "/agent/codex/threads/reset", { method: "POST" }).catch((error) => {
             addEventLog("新建对话失败", error);
             message.error(error instanceof Error ? error.message : "新建对话失败");
-        } finally {
-            setAgentState({ loadingThreads: false });
-        }
+            throw error;
+        });
+        resetThreadRef.current = request;
+        void request.finally(() => {
+            if (resetThreadRef.current === request) resetThreadRef.current = null;
+        }).catch(() => undefined);
     };
 
     const resumeThread = async (threadId: string) => {
@@ -666,7 +708,7 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
         const value = normalizeText(text) || title;
         const last = useAgentStore.getState().eventLogs.at(-1);
         if (last?.title === title && last.text === value) return;
-        pushEventLog({ id: `${Date.now()}-${Math.random()}`, time: new Date().toLocaleTimeString(), title, text: value, raw });
+        pushEventLog({ id: `${Date.now()}-${Math.random()}`, time: dayjs().format("YYYY-MM-DD HH:mm:ss"), title, text: value, raw });
     };
 
     const upsertActivityMessage = (item: AgentChatItem) => {
@@ -896,6 +938,21 @@ export function LocalAgentPanel({ embedded, headless, autoConnect }: { embedded?
                         onConfirmToolsChange={(confirmTools) => setAgentState({ confirmTools })}
                         permissionMode={permissionMode}
                         onPermissionModeChange={changePermissionMode}
+                        models={models}
+                        model={model}
+                        reasoningEffort={reasoningEffort}
+                        onModelChange={(model) => {
+                            const selected = models.find((item) => item.model === model);
+                            if (!selected) return;
+                            const effort = selected.defaultReasoningEffort || selected.supportedReasoningEfforts[0]?.reasoningEffort;
+                            localStorage.setItem("canvas-agent-model", model);
+                            if (effort) localStorage.setItem("canvas-agent-reasoning-effort", effort);
+                            setAgentState({ model, ...(effort ? { reasoningEffort: effort } : {}) });
+                        }}
+                        onReasoningEffortChange={(reasoningEffort) => {
+                            localStorage.setItem("canvas-agent-reasoning-effort", reasoningEffort);
+                            setAgentState({ reasoningEffort });
+                        }}
                         left={
                             attachments.length ? (
                                 <span className="text-[11px]" style={{ color: theme.node.muted }}>

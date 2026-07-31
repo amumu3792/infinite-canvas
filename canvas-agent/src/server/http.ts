@@ -4,11 +4,13 @@ import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 
 import { runClaudeTurn } from "../agent/claude.js";
-import { archiveCodexThread, interruptCodexTurn, isRecoverableThreadError, listCodexThreads, readCodexThread, resolveCodexApproval, resumeCodexThread, runCodexTurn, startCodexThread, summarizeCodexThread, verifyCodexThreadWorkspace } from "../agent/codex.js";
+import { archiveCodexThread, interruptCodexTurn, isRecoverableThreadError, listCodexModels, listCodexThreads, readCodexThread, resolveCodexApproval, resumeCodexThread, runCodexTurn, startCodexThread, summarizeCodexThread, verifyCodexThreadWorkspace } from "../agent/codex.js";
+import type { CodexReasoningEffort } from "../agent/codex-protocol.js";
 import type { AgentAttachment, AgentPermissionMode } from "../agent/types.js";
 import { CanvasSession } from "../canvas/session.js";
 import { DEFAULT_PORT, ensureSiteWorkspace, loadConfig, saveConfig, updateSiteWorkspace, type CanvasAgentConfig } from "../config.js";
 import { logger } from "../utils/logger.js";
+import { checkVersions } from "../version-check.js";
 
 /** 启动仅监听本机的 Canvas Agent HTTP 服务。 */
 export function startHttpServer() {
@@ -95,6 +97,7 @@ export function startHttpServer() {
         const workspace = ensureSiteWorkspace(config);
         res.json({ ok: true, workspace });
     });
+    app.get("/agent/codex/models", route(async (_req, res) => res.json({ ok: true, ...(await listCodexModels(emit)) })));
     app.get("/agent/codex/threads", route(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
         const result = await listCodexThreads(emit, { cwd: workspace.workspacePath, searchTerm: String(req.query.searchTerm || "") });
@@ -108,6 +111,10 @@ export function startHttpServer() {
         const nextWorkspace = setActiveThread(activeThreadId, { emptyThread: true });
         res.json({ ok: true, workspace: nextWorkspace, thread: summarizeCodexThread(thread), messages: [] });
     }));
+    app.post("/agent/codex/threads/reset", (req, res) => {
+        if (session.codexBusy) return res.status(409).json({ ok: false, error: "Codex 正在运行，请等待当前任务完成" });
+        res.json({ ok: true, workspace: setActiveThread("", { emptyThread: true, draftThread: true }) });
+    });
     app.get("/agent/codex/threads/:threadId", route(async (req, res) => {
         const workspace = ensureSiteWorkspace(config);
         const threadId = routeParam(req.params.threadId);
@@ -141,7 +148,9 @@ export function startHttpServer() {
         const prompt = String(req.body?.prompt || "");
         if (!prompt.trim()) return res.status(400).json({ ok: false, error: "请输入任务内容" });
         const clientId = String(req.body?.clientId || "");
-        logger.info("Codex turn accepted", { threadId: req.body?.threadId, promptLength: prompt.length, attachmentCount: attachments.length });
+        const model = String(req.body?.model || "") || undefined;
+        const effort = reasoningEffort(req.body?.effort);
+        logger.info("Codex turn accepted", { threadId: req.body?.threadId, model: model || "default", reasoningEffort: effort || "default", promptLength: prompt.length, attachmentCount: attachments.length });
         session.setCodexState({ busy: true, threadId: String(req.body?.threadId || workspace.activeThreadId || ""), turnId: "" });
         try {
             let threadId = String(req.body?.threadId || workspace.activeThreadId || "");
@@ -169,6 +178,8 @@ export function startHttpServer() {
                 threadId,
                 cwd: workspace.workspacePath,
                 permissionMode: permissionMode(req.body?.permissionMode),
+                model,
+                effort,
                 appEmit: emit,
                 onStart: clientId ? () => session.bindClient(clientId) : undefined,
                 onThread: (actualThreadId) => {
@@ -184,7 +195,7 @@ export function startHttpServer() {
                 },
                 onTurn: (actualTurnId) => {
                     turnId = actualTurnId;
-                    logger.info("Codex turn started", { threadId, turnId });
+                    logger.info("Codex turn started", { threadId, turnId, model: model || "default", reasoningEffort: effort || "default" });
                     session.setCodexState({ busy: true, threadId, turnId });
                 },
                 onFinish: () => {
@@ -219,6 +230,7 @@ export function startHttpServer() {
 
     app.listen(port, "127.0.0.1", () => {
         console.log("Infinite Canvas Agent");
+        checkVersions();
         console.log(`Local URL: ${config.url}`);
         console.log(`Connect token: ${config.token}`);
         console.log("Codex MCP is not installed by this command.");
@@ -241,6 +253,10 @@ function routeParam(value: string | string[]) {
 
 function permissionMode(value: unknown): AgentPermissionMode {
     return value === "automatic" || value === "full" ? value : "request";
+}
+
+function reasoningEffort(value: unknown): CodexReasoningEffort | undefined {
+    return value === "minimal" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max" || value === "ultra" ? value : undefined;
 }
 
 /** 使用当前操作系统的文件管理器定位本地文件。 */

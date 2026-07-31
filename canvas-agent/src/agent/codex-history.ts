@@ -48,7 +48,7 @@ export function threadMessages(thread: unknown, planUpdates: CodexPlanUpdate[] =
                 const tool = String(field(item, "tool") || "工具调用");
                 const error = String(field(field(item, "error"), "message") || "");
                 const input = toolArguments(field(item, "arguments"));
-                messages.push({ id, role: "tool", title: toolName(tool), text: error || toolHistorySummary(tool, input), detail: toolHistoryDetail(tool, item, input, error) });
+                messages.push({ id, role: "tool", title: toolName(tool), text: error || toolHistorySummary(tool, item, input), detail: toolHistoryDetail(tool, item, input, error) });
             }
             if (type === "commandExecution") {
                 const command = String(field(item, "command") || "").trim();
@@ -70,7 +70,14 @@ export function threadMessages(thread: unknown, planUpdates: CodexPlanUpdate[] =
             if (type === "imageView") messages.push({ id, role: "tool", title: "查看图片", text: String(field(item, "path") || "已查看图片"), detail: { kind: "image", status: "completed" } });
             if (type === "imageGeneration") messages.push({ id, role: "tool", title: "内置生图", text: String(field(item, "savedPath") || "图片生成完成"), detail: { kind: "image", status: field(item, "status"), savedPath: field(item, "savedPath") } });
             if (type === "contextCompaction") messages.push({ id, role: "tool", title: "整理上下文", text: "已整理当前对话，继续处理任务", detail: { kind: "context", status: "completed" } });
-            if (type === "dynamicToolCall") messages.push({ id, role: "tool", title: "使用工具", text: "已完成工具操作", detail: { kind: "tool", status: field(item, "status") } });
+            if (type === "dynamicToolCall") {
+                const tool = String(field(item, "tool") || "");
+                const title = toolName(tool);
+                const error = String(field(field(item, "error"), "message") || "");
+                const status = String(field(item, "status") || "");
+                const failed = Boolean(error) || field(item, "success") === false || status === "failed" || status === "error";
+                messages.push({ id, role: "tool", title, text: error || readableText(field(item, "contentItems")) || `${title}${failed ? "失败" : "完成"}`, detail: { kind: "tool", status: failed ? "failed" : status } });
+            }
             if (type === "collabToolCall") messages.push({ id, role: "tool", title: "协作处理", text: "已完成协作任务", detail: { kind: "tool", status: field(item, "status") } });
         });
         if (planMessage && !planAdded) messages.push(planMessage);
@@ -162,15 +169,56 @@ function toolHistoryDetail(tool: string, item: unknown, input: unknown, error: s
 }
 
 /** 生成 MCP 工具在对话中的结果摘要。 */
-function toolHistorySummary(tool: string, input: unknown) {
+function toolHistorySummary(tool: string, item: unknown, input: unknown) {
     if (tool === "site_navigate") return `已打开${routeName(String(field(input, "path") || "/"))}`;
     if (tool === "canvas_list_projects") return "已读取画布列表";
-    if (tool === "canvas_get_state") return "已读取当前画布内容";
+    if (tool === "canvas_get_state") {
+        const result = parseToolResult(field(item, "result"));
+        const nodes = arrayValue(field(result, "nodes"));
+        const connections = arrayValue(field(result, "connections"));
+        return nodes.length || connections.length || result ? canvasContentSummary(nodes, connections.length) : "已读取当前画布内容";
+    }
     if (tool === "canvas_get_selection") return "已读取当前选中内容";
     if (tool === "prompts_search") return `已搜索提示词“${String(field(input, "query") || "") || "全部"}”`;
     if (tool === "assets_list") return "已读取我的素材";
     if (tool === "generation_get_status") return "已检查生成任务状态";
     return `${toolName(tool)}已完成`;
+}
+
+/** 按节点类型生成人类可读的画布内容概览。 */
+function canvasContentSummary(nodes: unknown[], connections: number) {
+    const counts = nodes.reduce<Record<string, number>>((result, node) => {
+        const type = String(field(node, "type") || "other");
+        result[type] = (result[type] || 0) + 1;
+        return result;
+    }, {});
+    const known = new Set(["text", "image", "config", "video", "audio", "group"]);
+    const other = Object.entries(counts).reduce((total, [type, count]) => total + (known.has(type) ? 0 : count), 0);
+    const parts = [
+        counts.text ? `${counts.text} 个文本` : "",
+        counts.image ? `${counts.image} 张图片` : "",
+        counts.config ? `${counts.config} 个配置` : "",
+        counts.video ? `${counts.video} 个视频` : "",
+        counts.audio ? `${counts.audio} 个音频` : "",
+        counts.group ? `${counts.group} 个分组` : "",
+        other ? `${other} 个其他节点` : "",
+        connections ? `${connections} 条连线` : "",
+    ].filter(Boolean);
+    return parts.length ? parts.join("、") : "当前画布为空";
+}
+
+/** 从 MCP 历史结果中还原工具返回的数据。 */
+function parseToolResult(result: unknown) {
+    const content = field(result, "content");
+    const text = arrayValue(content)
+        .map((item) => field(item, "text"))
+        .filter((item): item is string => typeof item === "string")
+        .join("\n");
+    try {
+        return text ? JSON.parse(text) : result;
+    } catch {
+        return text || result;
+    }
 }
 
 /** 提取工具参数中适合普通用户查看的信息。 */
@@ -255,6 +303,11 @@ function routeName(path: string) {
 
 /** 将 MCP 工具名称转换为聊天记录中的中文标题。 */
 function toolName(name: string) {
+    if (name === "imagegen" || name.endsWith("__imagegen")) return "生成图片";
+    if (name === "view_image" || name.endsWith("__view_image")) return "查看图片";
+    if (name === "exec" || name === "exec_command" || name.endsWith("__exec_command")) return "执行命令";
+    if (name === "apply_patch" || name.endsWith("__apply_patch")) return "修改文件";
+    if (name === "web__run" || name.endsWith("__web__run")) return "搜索资料";
     if (name === "site_navigate") return "打开页面";
     if (name === "canvas_list_projects") return "查看画布列表";
     if (name === "canvas_apply_ops") return "画布操作";
@@ -289,5 +342,5 @@ function toolName(name: string) {
     if (name === "assets_list") return "查看我的素材";
     if (name === "assets_add") return "添加到我的素材";
     if (name === "generation_get_status") return "查看生成状态";
-    return "工具操作";
+    return name ? `调用工具：${name}` : "工具操作";
 }

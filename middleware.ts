@@ -1,43 +1,34 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-export function middleware(req: NextRequest) {
-  const SITE_USER = process.env.SITE_USER;
-  const SITE_PASS = process.env.SITE_PASS;
+const BASIC_USER = process.env.SITE_USER || '';
+const BASIC_PASS = process.env.SITE_PASS || '';
 
-  // 强制校验：如果没有配置环境变量，直接拦截
-  if (!SITE_USER || !SITE_PASS) {
-    return new NextResponse('Server configuration error', { status: 500 });
+export function middleware(req: NextRequest) {
+  // 没配环境变量就别拦了，避免锁死自己
+  if (!BASIC_USER || !BASIC_PASS) {
+    return NextResponse.next();
   }
 
-  // API 接口放行，不需要密码
+  // API 路由放行，保证你之前加的 AI 代理能用
   if (req.nextUrl.pathname.startsWith('/api')) {
     return NextResponse.next();
   }
 
-  const authHeader = req.headers.get('authorization');
-  if (authHeader && authHeader.startsWith('Basic ')) {
-    const encoded = authHeader.slice(6);
-    try {
-      const decoded = Buffer.from(encoded, 'base64').toString('utf-8');
-      const [user, pass] = decoded.split(':');
-      if (user === SITE_USER && pass === SITE_PASS) {
-        return NextResponse.next();
-      }
-    } catch (e) {
-      // 解码失败，视为未授权
+  const auth = req.headers.get('authorization');
+  if (auth && auth.startsWith('Basic ')) {
+    const decoded = Buffer.from(auth.slice(6), 'base64').toString('utf8');
+    const [u, p] = decoded.split(':');
+    if (u === BASIC_USER && p === BASIC_PASS) {
+      return NextResponse.next();
     }
   }
 
-  // 未通过验证，弹出浏览器自带的登录框
-  return new NextResponse('Authentication Required', {
+  return new Response('Auth Required', {
     status: 401,
-    headers: {
-      'WWW-Authenticate': 'Basic realm="Secure Area"'
-    },
+    headers: { 'WWW-Authenticate': 'Basic realm="Secure Area"' },
   });
 }
 
-// 配置匹配规则：除了 _next, static, favicon 等静态资源，其他都走中间件
 export const config = {
   matcher: '/((?!_next/static|_next/image|favicon.ico).*)',
 };

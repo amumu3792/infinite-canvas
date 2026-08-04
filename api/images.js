@@ -47,7 +47,7 @@ module.exports = async function handler(req, res) {
       });
 
       // 只有明确的“路径/格式不存在”才尝试下一种协议
-      if (![404, 405, 415].includes(result.status)) {
+      if (![400, 401, 403, 404, 405, 415].includes(result.status)) {
         break;
       }
     }

@@ -1,9 +1,7 @@
-import { NextRequest } from "next/server";
-
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
-type ImageRequestInput = {
+type ImageProxyBody = {
     baseUrl?: string;
     apiKey?: string;
     model?: string;
@@ -16,309 +14,172 @@ type ImageRequestInput = {
     };
 };
 
-type ImageAttempt = {
-    protocol: "openai-compatible" | "web-proxy";
-    url: string;
-    headers: Record<string, string>;
-    model: string;
-    prompt: string;
-    images: string[];
-    params: NonNullable<ImageRequestInput["params"]>;
-};
-
-type AttemptResult = {
-    ok: boolean;
-    status: number;
-    text: string;
-    json: unknown;
-};
-
-export async function POST(request: NextRequest) {
+export async function POST(request: Request) {
     try {
-        const input = (await request.json()) as ImageRequestInput;
-        const { baseUrl, apiKey, model, prompt, images = [], params = {} } = input;
+        const body = (await request.json()) as ImageProxyBody;
+
+        const baseUrl = String(body.baseUrl || "").replace(/\/+$/, "");
+        const apiKey = String(body.apiKey || "");
+        const model = String(body.model || "");
+        const prompt = String(body.prompt || "");
+        const images = Array.isArray(body.images) ? body.images : [];
+        const params = body.params || {};
 
         if (!baseUrl || !apiKey || !model || !prompt) {
-            return Response.json(
-                { error: "Missing baseUrl, apiKey, model or prompt" },
-                { status: 400 },
+            return json({ error: "Missing baseUrl, apiKey, model or prompt" }, 400);
+        }
+
+        const endpoint = images.length > 0 ? "/v1/images/edits" : "/v1/images/generations";
+        const url = `${removeImageEndpointSuffix(baseUrl)}${endpoint}`;
+
+        const response = images.length > 0
+            ? await requestImageEdit(url, apiKey, model, prompt, images, params)
+            : await requestImageGeneration(url, apiKey, model, prompt, params);
+
+        const text = await response.text();
+
+        if (!response.ok) {
+            return json(
+                {
+                    error: "Upstream image request failed",
+                    url,
+                    status: response.status,
+                    detail: text.slice(0, 1000),
+                },
+                502,
             );
         }
 
-        const attempts = buildAttempts({
-            baseUrl,
-            apiKey,
-            model,
-            prompt,
-            images,
-            params,
-        });
-        const failures: Array<{
-            protocol: string;
-            url: string;
-            status: number;
-            detail: string;
-        }> = [];
-
-        for (const attempt of attempts) {
-            const result = await sendAttempt(attempt);
-
-            if (result.ok) {
-                return Response.json(normalizeResponse(result.json));
-            }
-
-            failures.push({
-                protocol: attempt.protocol,
-                url: attempt.url,
-                status: result.status,
-                detail: result.text.slice(0, 500),
-            });
-
-            if (!shouldTryNextAttempt(result)) {
-                break;
-            }
+        try {
+            const data = JSON.parse(text);
+            return json(normalizeImageResponse(data), 200);
+        } catch {
+            return json(
+                {
+                    error: "Upstream returned invalid JSON",
+                    url,
+                    status: response.status,
+                    detail: text.slice(0, 1000),
+                },
+                502,
+            );
         }
-
-        return Response.json(
-            {
-                error: "No supported image protocol",
-                attempts: failures,
-            },
-            { status: 502 },
-        );
     } catch (error) {
-        return Response.json(
-            { error: error instanceof Error ? error.message : String(error) },
-            { status: 500 },
+        return json(
+            {
+                error: "Image proxy crashed",
+                detail: error instanceof Error ? error.message : String(error),
+            },
+            500,
         );
     }
 }
 
-function buildAttempts({
-    baseUrl,
-    apiKey,
-    model,
-    prompt,
-    images,
-    params,
-}: {
-    baseUrl: string;
-    apiKey: string;
-    model: string;
-    prompt: string;
-    images: string[];
-    params: NonNullable<ImageRequestInput["params"]>;
-}) {
-    const inputUrl = new URL(baseUrl);
-    const origin = inputUrl.origin;
-    const isEdit = images.length > 0;
-    const action = isEdit ? "edits" : "generations";
-    const inputPath = inputUrl.pathname.replace(/\/+$/, "");
-    const standardBase = removeKnownSuffix(baseUrl);
-    const standardUrl = `${standardBase}/v1/images/${action}`;
-
-    const isProxyEndpoint =
-        inputPath.includes("/proxy") ||
-        inputPath.includes("/image-studio");
-
-    if (isProxyEndpoint) {
-        return [
-            createProxyAttempt({
-                url: inputUrl.toString(),
-                targetUrl: `${origin}/v1/images/${action}`,
-                apiKey,
-                model,
-                prompt,
-                images,
-                params,
-            }),
-        ];
-    }
-
-    return [
-        {
-            protocol: "openai-compatible" as const,
-            url: standardUrl,
-            headers: {
-                Authorization: `Bearer ${apiKey}`,
-            },
-            model,
-            prompt,
-            images,
-            params,
-        },
-        createProxyAttempt({
-            url: `${origin}/api/v1/user/image-studio/proxy`,
-            targetUrl: standardUrl,
-            apiKey,
-            model,
-            prompt,
-            images,
-            params,
-        }),
-    ];
-}
-
-function createProxyAttempt({
-    url,
-    targetUrl,
-    apiKey,
-    model,
-    prompt,
-    images,
-    params,
-}: {
-    url: string;
-    targetUrl: string;
-    apiKey: string;
-    model: string;
-    prompt: string;
-    images: string[];
-    params: NonNullable<ImageRequestInput["params"]>;
-}): ImageAttempt {
-    const headers: Record<string, string> = {
-        "x-image-studio-api-key": apiKey,
-        "x-image-studio-target-url": targetUrl,
-    };
-
-    if (process.env.IMAGE_PROXY_BEARER) {
-        headers.Authorization = `Bearer ${process.env.IMAGE_PROXY_BEARER}`;
-    }
-
-    return {
-        protocol: "web-proxy",
-        url,
-        headers,
+async function requestImageGeneration(
+    url: string,
+    apiKey: string,
+    model: string,
+    prompt: string,
+    params: NonNullable<ImageProxyBody["params"]>,
+) {
+    const payload: Record<string, unknown> = {
         model,
         prompt,
-        images,
-        params,
+        n: Number(params.count || 1),
+        size: params.size || "1024x1024",
+        response_format: "b64_json",
     };
-}
 
-async function sendAttempt(attempt: ImageAttempt): Promise<AttemptResult> {
-    const count = Number(attempt.params.count || 1);
-    const size = attempt.params.size || "1024x1024";
-    const quality = attempt.params.quality;
-
-    if (attempt.images.length === 0) {
-        const body: Record<string, unknown> = {
-            model: attempt.model,
-            prompt: attempt.prompt,
-            n: count,
-            size,
-            response_format: "b64_json",
-        };
-
-        if (quality) {
-            body.quality = quality;
-        }
-
-        const response = await fetch(attempt.url, {
-            method: "POST",
-            headers: {
-                ...attempt.headers,
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify(body),
-        });
-
-        return readResponse(response);
+    if (params.quality) {
+        payload.quality = params.quality;
     }
 
+    return fetch(url, {
+        method: "POST",
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+    });
+}
+
+async function requestImageEdit(
+    url: string,
+    apiKey: string,
+    model: string,
+    prompt: string,
+    images: string[],
+    params: NonNullable<ImageProxyBody["params"]>,
+) {
     const form = new FormData();
 
-    form.set("model", attempt.model);
-    form.set("prompt", attempt.prompt);
-    form.set("n", String(count));
-    form.set("size", size);
+    form.set("model", model);
+    form.set("prompt", prompt);
+    form.set("n", String(Number(params.count || 1)));
+    form.set("size", params.size || "1024x1024");
     form.set("response_format", "b64_json");
 
-    if (quality) {
-        form.set("quality", quality);
+    if (params.quality) {
+        form.set("quality", params.quality);
     }
 
-    for (let index = 0; index < attempt.images.length; index += 1) {
-        const dataUrl = attempt.images[index];
-        form.append("image", dataUrlToBlob(dataUrl), `ref-${index + 1}.png`);
+    for (let index = 0; index < images.length; index += 1) {
+        const image = images[index];
+        form.append("image", dataUrlToBlob(image), `reference-${index + 1}.png`);
     }
 
-    const response = await fetch(attempt.url, {
+    return fetch(url, {
         method: "POST",
-        headers: attempt.headers,
+        headers: {
+            Authorization: `Bearer ${apiKey}`,
+        },
         body: form,
     });
-
-    return readResponse(response);
 }
 
-async function readResponse(response: Response): Promise<AttemptResult> {
-    const text = await response.text();
-    let json: unknown = null;
-
-    try {
-        json = JSON.parse(text);
-    } catch {
-        json = null;
-    }
-
-    return {
-        ok: response.ok,
-        status: response.status,
-        text,
-        json,
-    };
-}
-
-function shouldTryNextAttempt(result: AttemptResult) {
-    const text = String(result.text || "");
-    const looksLikeHtml =
-        text.trim().startsWith("<") ||
-        text.includes("<!DOCTYPE html") ||
-        text.includes("<html");
-
-    return (
-        looksLikeHtml ||
-        [400, 401, 403, 404, 405, 415, 422].includes(result.status)
-    );
-}
-
-function normalizeResponse(json: unknown) {
-    const payload = json as {
+function normalizeImageResponse(data: unknown) {
+    const payload = data as {
         data?: unknown;
         images?: unknown;
-    } | null;
+    };
 
-    const nestedData =
-        payload?.data && typeof payload.data === "object" && !Array.isArray(payload.data)
-            ? (payload.data as { data?: unknown }).data
-            : undefined;
-
-    const data =
+    const items =
         Array.isArray(payload?.data)
             ? payload.data
-            : Array.isArray(nestedData)
-                ? nestedData
-                : Array.isArray(payload?.images)
-                    ? payload.images
+            : Array.isArray(payload?.images)
+                ? payload.images
+                : Array.isArray(data)
+                    ? data
                     : [];
 
-    return { data };
+    return { data: items };
 }
 
-function removeKnownSuffix(value: string) {
-    return value
-        .trim()
+function removeImageEndpointSuffix(baseUrl: string) {
+    return baseUrl
         .replace(/\/+$/, "")
         .replace(/\/v1\/images\/(generations|edits)$/, "")
         .replace(/\/v1$/, "");
 }
 
 function dataUrlToBlob(dataUrl: string) {
-    const [meta, base64] = dataUrl.split(",");
-    const mime = /data:(.*?);base64/.exec(meta)?.[1] || "image/png";
+    const match = /^data:(.*?);base64,(.*)$/.exec(dataUrl);
+    if (!match) {
+        throw new Error("Reference image must be a dataURL");
+    }
 
-    return new Blob([Buffer.from(base64, "base64")], {
-        type: mime,
-    });
+    const mime = match[1] || "image/png";
+    const binary = atob(match[2]);
+    const bytes = new Uint8Array(binary.length);
+
+    for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+    }
+
+    return new Blob([bytes], { type: mime });
+}
+
+function json(data: unknown, status: number) {
+    return Response.json(data, { status });
 }

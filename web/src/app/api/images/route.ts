@@ -87,7 +87,7 @@ async function requestImageGeneration(
         prompt,
         n: Number(params.count || 1),
         size: params.size || "1024x1024",
-        response_format: "b64_json",
+        response_format: "url",
     };
 
     if (params.quality) {
@@ -118,7 +118,7 @@ async function requestImageEdit(
     form.set("prompt", prompt);
     form.set("n", String(Number(params.count || 1)));
     form.set("size", params.size || "1024x1024");
-    form.set("response_format", "b64_json");
+    form.set("response_format", "url");
 
     if (params.quality) {
         form.set("quality", params.quality);

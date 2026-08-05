@@ -1,3 +1,5 @@
+const { Buffer } = require("node:buffer");
+
 module.exports = async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Use POST" });
@@ -7,14 +9,17 @@ module.exports = async function handler(req, res) {
     const input =
       typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
 
-    const {
-      baseUrl,
-      apiKey,
-      model,
-      prompt,
-      images = [],
-      params = {},
-    } = input;
+    const baseUrl = String(input.baseUrl || "")
+      .trim()
+      .replace(/\/+$/, "")
+      .replace(/\/v1\/images\/(generations|edits)$/, "")
+      .replace(/\/v1$/, "");
+
+    const apiKey = String(input.apiKey || "");
+    const model = String(input.model || "");
+    const prompt = String(input.prompt || "");
+    const images = Array.isArray(input.images) ? input.images : [];
+    const params = input.params || {};
 
     if (!baseUrl || !apiKey || !model || !prompt) {
       return res.status(400).json({
@@ -22,137 +27,142 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    const attempts = buildAttempts({
-      baseUrl,
-      apiKey,
-      model,
-      prompt,
-      images,
-      params,
-    });
+    const response = images.length
+      ? await createImageEdit(baseUrl, apiKey, model, prompt, images, params)
+      : await createImage(baseUrl, apiKey, model, prompt, params);
 
-    const failures = [];
+    const text = await response.text();
 
-    for (const attempt of attempts) {
-      const result = await sendAttempt(attempt);
-
-      if (result.ok) {
-        return res.status(200).json(normalizeResponse(result.json));
-      }
-
-      failures.push({
-        protocol: attempt.protocol,
-        url: attempt.url,
-        status: result.status,
-        detail: result.text.slice(0, 300),
+    if (!response.ok) {
+      return res.status(502).json({
+        error: "Image provider request failed",
+        status: response.status,
+        detail: text.slice(0, 1000),
       });
-
-      if (!shouldTryNextAttempt(result)) {
-        break;
-      }
     }
 
-    return res.status(502).json({
-      error: "No supported image protocol",
-      attempts: failures,
-    });
+    let result;
+    try {
+      result = JSON.parse(text);
+    } catch {
+      return res.status(502).json({
+        error: "Image provider returned invalid JSON",
+        detail: text.slice(0, 1000),
+      });
+    }
+
+    const data = normalizeResult(result);
+
+    if (!data.length) {
+      return res.status(502).json({
+        error: "Image provider returned no images",
+        detail: result,
+      });
+    }
+
+    return res.status(200).json({ data });
   } catch (error) {
     return res.status(500).json({
-      error: error.message || String(error),
+      error: "Image proxy failed",
+      detail: error instanceof Error ? error.message : String(error),
     });
   }
 };
 
-function shouldTryNextAttempt(result) {
-  const text = String(result.text || "");
-  const looksLikeHtml =
-    text.trim().startsWith("<") ||
-    text.includes("<!DOCTYPE html") ||
-    text.includes("<html");
-
-  return (
-    looksLikeHtml ||
-    [400, 401, 403, 404, 405, 415, 422].includes(result.status)
-  );
-}
-
-function buildAttempts({ baseUrl, apiKey, model, prompt, images, params }) {
-  const inputUrl = new URL(baseUrl);
-  const origin = inputUrl.origin;
-  const isEdit = images.length > 0;
-  const action = isEdit ? "edits" : "generations";
-
-  const attempts = [];
-  const inputPath = inputUrl.pathname.replace(/\/+$/, "");
-
-  const isProxyEndpoint =
-    inputPath.includes("/proxy") ||
-    inputPath.includes("/image-studio");
-
-  if (isProxyEndpoint) {
-    attempts.push(
-      createProxyAttempt({
-        url: inputUrl.toString(),
-        targetUrl: `${origin}/v1/images/${action}`,
-        apiKey,
-        model,
-        prompt,
-        images,
-        params,
-      })
-    );
-
-    return attempts;
-  }
-
-  const standardBase = removeKnownSuffix(baseUrl);
-  const standardUrl = `${standardBase}/v1/images/${action}`;
-
-  attempts.push({
-    protocol: "openai-compatible",
-    url: standardUrl,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
+async function createImage(baseUrl, apiKey, model, prompt, params) {
+  const payload = {
     model,
     prompt,
-    images,
-    params,
+    n: Number(params.count || 1),
+    response_format: "url",
+  };
+
+  if (params.size && params.size !== "auto") {
+    payload.size = params.size;
+  }
+
+  if (params.quality && params.quality !== "auto") {
+    payload.quality = params.quality;
+  }
+
+  return fetch(`${baseUrl}/v1/images/generations`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
   });
-
-  attempts.push(
-    createProxyAttempt({
-      url: `${origin}/api/v1/user/image-studio/proxy`,
-      targetUrl: standardUrl,
-      apiKey,
-      model,
-      prompt,
-      images,
-      params,
-    })
-  );
-
-  return attempts;
 }
 
-function createProxyAttempt({
-  url,
-  targetUrl,
+async function createImageEdit(
+  baseUrl,
   apiKey,
   model,
   prompt,
   images,
   params,
-}) {
-  const headers = {
-    "x-image-studio-api-key": apiKey,
-    "x-image-studio-target-url": targetUrl,
-  };
+) {
+  const form = new FormData();
 
-  if (process.env.IMAGE_PROXY_BEARER) {
-    headers.Authorization = `Bearer ${process.env.IMAGE_PROXY_BEARER}`;
+  form.set("model", model);
+  form.set("prompt", prompt);
+  form.set("n", String(Number(params.count || 1)));
+  form.set("response_format", "url");
+
+  if (params.size && params.size !== "auto") {
+    form.set("size", params.size);
   }
 
-  return {
-    protocol: "web-proxy",
-    ur
+  if (params.quality && params.quality !== "auto") {
+    form.set("quality", params.quality);
+  }
+
+  for (let index = 0; index < images.length; index += 1) {
+    form.append(
+      "image",
+      dataUrlToBlob(images[index]),
+      `reference-${index + 1}.png`,
+    );
+  }
+
+  return fetch(`${baseUrl}/v1/images/edits`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: form,
+  });
+}
+
+function normalizeResult(result) {
+  if (Array.isArray(result)) {
+    return result;
+  }
+
+  if (Array.isArray(result?.data)) {
+    return result.data;
+  }
+
+  if (Array.isArray(result?.data?.data)) {
+    return result.data.data;
+  }
+
+  if (Array.isArray(result?.images)) {
+    return result.images;
+  }
+
+  return [];
+}
+
+function dataUrlToBlob(value) {
+  const match = /^data:([^;]+);base64,(.*)$/s.exec(String(value || ""));
+
+  if (!match) {
+    throw new Error("Reference image is not a valid dataURL");
+  }
+
+  return new Blob([Buffer.from(match[2], "base64")], {
+    type: match[1] || "image/png",
+  });
+}

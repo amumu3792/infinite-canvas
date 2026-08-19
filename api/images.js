@@ -19,7 +19,6 @@ module.exports = async function handler(req, res) {
     const model = String(input.model || "");
     const prompt = String(input.prompt || "");
     const images = Array.isArray(input.images) ? input.images : [];
-    const params = input.params || {};
 
     if (!baseUrl || !apiKey || !model || !prompt) {
       return res.status(400).json({
@@ -28,8 +27,8 @@ module.exports = async function handler(req, res) {
     }
 
     const response = images.length
-      ? await createImageEdit(baseUrl, apiKey, model, prompt, images, params)
-      : await createImage(baseUrl, apiKey, model, prompt, params);
+      ? await createImageEdit(baseUrl, apiKey, model, prompt, images)
+      : await createImage(baseUrl, apiKey, model, prompt);
 
     const text = await response.text();
 
@@ -37,7 +36,7 @@ module.exports = async function handler(req, res) {
       return res.status(502).json({
         error: "Image provider request failed",
         status: response.status,
-        detail: text.slice(0, 1000),
+        detail: text.slice(0, 2000),
       });
     }
 
@@ -47,7 +46,7 @@ module.exports = async function handler(req, res) {
     } catch {
       return res.status(502).json({
         error: "Image provider returned invalid JSON",
-        detail: text.slice(0, 1000),
+        detail: text.slice(0, 2000),
       });
     }
 
@@ -69,54 +68,27 @@ module.exports = async function handler(req, res) {
   }
 };
 
-async function createImage(baseUrl, apiKey, model, prompt, params) {
-  const payload = {
-    model,
-    prompt,
-    n: Number(params.count || 1),
-    response_format: "url",
-  };
-
-  if (params.size && params.size !== "auto") {
-    payload.size = params.size;
-  }
-
-  if (params.quality && params.quality !== "auto") {
-    payload.quality = params.quality;
-  }
-
+async function createImage(baseUrl, apiKey, model, prompt) {
   return fetch(`${baseUrl}/v1/images/generations`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      model,
+      prompt,
+      n: 1,
+    }),
   });
 }
 
-async function createImageEdit(
-  baseUrl,
-  apiKey,
-  model,
-  prompt,
-  images,
-  params,
-) {
+async function createImageEdit(baseUrl, apiKey, model, prompt, images) {
   const form = new FormData();
 
   form.set("model", model);
   form.set("prompt", prompt);
-  form.set("n", String(Number(params.count || 1)));
-  form.set("response_format", "url");
-
-  if (params.size && params.size !== "auto") {
-    form.set("size", params.size);
-  }
-
-  if (params.quality && params.quality !== "auto") {
-    form.set("quality", params.quality);
-  }
+  form.set("n", "1");
 
   for (let index = 0; index < images.length; index += 1) {
     form.append(
@@ -136,22 +108,10 @@ async function createImageEdit(
 }
 
 function normalizeResult(result) {
-  if (Array.isArray(result)) {
-    return result;
-  }
-
-  if (Array.isArray(result?.data)) {
-    return result.data;
-  }
-
-  if (Array.isArray(result?.data?.data)) {
-    return result.data.data;
-  }
-
-  if (Array.isArray(result?.images)) {
-    return result.images;
-  }
-
+  if (Array.isArray(result)) return result;
+  if (Array.isArray(result?.data)) return result.data;
+  if (Array.isArray(result?.data?.data)) return result.data.data;
+  if (Array.isArray(result?.images)) return result.images;
   return [];
 }
 

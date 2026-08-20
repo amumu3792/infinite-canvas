@@ -61,7 +61,13 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    return res.status(200).json({ data });
+    // 媒体接口返回的是跨域资源 URL。
+    // 在服务端下载并转换成 data URL，避免浏览器 CORS 拦截。
+    const finalData = isMediaApi(baseUrl)
+      ? await materializeImages(data)
+      : data;
+
+    return res.status(200).json({ data: finalData });
   } catch (error) {
     return res.status(500).json({
       error: "Image proxy failed",
@@ -71,16 +77,16 @@ module.exports = async function handler(req, res) {
 };
 
 async function createImage(baseUrl, apiKey, model, prompt, params) {
-  const isMediaApi = baseUrl.includes("/media");
+  const media = isMediaApi(baseUrl);
 
   const payload = {
     model,
     prompt,
-    n: isMediaApi ? 1 : normalizeCount(params.count),
+    n: media ? 1 : normalizeCount(params.count),
     response_format: "url",
   };
 
-  if (isMediaApi) {
+  if (media) {
     payload.size = normalizeMediaSize(params.size, model);
 
     if (model === "gpt-image-2") {
@@ -114,18 +120,15 @@ async function createImageEdit(
   images,
   params,
 ) {
-  const isMediaApi = baseUrl.includes("/media");
+  const media = isMediaApi(baseUrl);
   const form = new FormData();
 
   form.set("model", model);
   form.set("prompt", prompt);
-  form.set(
-    "n",
-    String(isMediaApi ? 1 : normalizeCount(params.count)),
-  );
+  form.set("n", String(media ? 1 : normalizeCount(params.count)));
   form.set("response_format", "url");
 
-  if (isMediaApi) {
+  if (media) {
     form.set("size", normalizeMediaSize(params.size, model));
 
     if (model === "gpt-image-2") {
@@ -156,6 +159,53 @@ async function createImageEdit(
     },
     body: form,
   });
+}
+
+async function materializeImages(items) {
+  return Promise.all(
+    items.map(async (item) => {
+      if (typeof item === "string") {
+        return item.startsWith("data:")
+          ? item
+          : await downloadAsDataUrl(item);
+      }
+
+      if (item?.dataUrl) {
+        return item.dataUrl;
+      }
+
+      if (item?.b64_json) {
+        return `data:image/png;base64,${item.b64_json}`;
+      }
+
+      if (item?.url) {
+        return await downloadAsDataUrl(item.url);
+      }
+
+      throw new Error("Image item missing dataUrl/url/b64_json");
+    }),
+  );
+}
+
+async function downloadAsDataUrl(url) {
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(
+      `Generated image download failed: ${response.status}`,
+    );
+  }
+
+  const contentType =
+    response.headers.get("content-type") || "image/png";
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+
+  return `data:${contentType};base64,${buffer.toString("base64")}`;
+}
+
+function isMediaApi(baseUrl) {
+  return /\/media$/i.test(baseUrl);
 }
 
 function normalizeCount(value) {

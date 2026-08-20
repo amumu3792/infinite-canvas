@@ -15,9 +15,9 @@ module.exports = async function handler(req, res) {
       .replace(/\/v1\/images\/(generations|edits)$/, "")
       .replace(/\/v1$/, "");
 
-    const apiKey = String(input.apiKey || "");
-    const model = String(input.model || "");
-    const prompt = String(input.prompt || "");
+    const apiKey = String(input.apiKey || "").trim();
+    const model = String(input.model || "").trim();
+    const prompt = String(input.prompt || "").trim();
     const images = Array.isArray(input.images) ? input.images : [];
     const params = input.params || {};
 
@@ -42,6 +42,7 @@ module.exports = async function handler(req, res) {
     }
 
     let result;
+
     try {
       result = JSON.parse(text);
     } catch {
@@ -70,19 +71,31 @@ module.exports = async function handler(req, res) {
 };
 
 async function createImage(baseUrl, apiKey, model, prompt, params) {
+  const isMediaApi = isMediaBaseUrl(baseUrl);
+
   const payload = {
     model,
     prompt,
-    n: Number(params.count || 1),
+    n: isMediaApi ? 1 : normalizeCount(params.count),
     response_format: "url",
   };
 
-  if (params.size && params.size !== "auto") {
-    payload.size = params.size;
-  }
+  if (isMediaApi) {
+    payload.size = normalizeMediaSize(params.size, model);
 
-  if (params.quality && params.quality !== "auto") {
-    payload.quality = params.quality;
+    // gpt-image-2 的媒体规格要求 medium。
+    // 当前中转站 gpt-image-2 没有可用通道，但保留正确参数。
+    if (model === "gpt-image-2") {
+      payload.quality = "medium";
+    }
+  } else {
+    if (params.size && params.size !== "auto") {
+      payload.size = params.size;
+    }
+
+    if (params.quality && params.quality !== "auto") {
+      payload.quality = params.quality;
+    }
   }
 
   return fetch(`${baseUrl}/v1/images/generations`, {
@@ -103,19 +116,31 @@ async function createImageEdit(
   images,
   params,
 ) {
+  const isMediaApi = isMediaBaseUrl(baseUrl);
   const form = new FormData();
 
   form.set("model", model);
   form.set("prompt", prompt);
-  form.set("n", String(Number(params.count || 1)));
+  form.set(
+    "n",
+    String(isMediaApi ? 1 : normalizeCount(params.count)),
+  );
   form.set("response_format", "url");
 
-  if (params.size && params.size !== "auto") {
-    form.set("size", params.size);
-  }
+  if (isMediaApi) {
+    form.set("size", normalizeMediaSize(params.size, model));
 
-  if (params.quality && params.quality !== "auto") {
-    form.set("quality", params.quality);
+    if (model === "gpt-image-2") {
+      form.set("quality", "medium");
+    }
+  } else {
+    if (params.size && params.size !== "auto") {
+      form.set("size", params.size);
+    }
+
+    if (params.quality && params.quality !== "auto") {
+      form.set("quality", params.quality);
+    }
   }
 
   for (let index = 0; index < images.length; index += 1) {
@@ -133,6 +158,68 @@ async function createImageEdit(
     },
     body: form,
   });
+}
+
+function isMediaBaseUrl(baseUrl) {
+  return /\/media$/i.test(baseUrl);
+}
+
+function normalizeCount(value) {
+  const count = Number(value || 1);
+
+  if (!Number.isFinite(count) || count < 1) {
+    return 1;
+  }
+
+  return Math.min(Math.floor(count), 4);
+}
+
+function normalizeMediaSize(size, model) {
+  // 当前可用的 canvas-image-fast 只支持 1K。
+  if (
+    model === "canvas-image-fast" ||
+    model === "canvas-image-lite"
+  ) {
+    return "1K";
+  }
+
+  // gpt-image-2 当前媒体列表显示只支持 1K。
+  if (model === "gpt-image-2") {
+    return "1K";
+  }
+
+  if (!size || size === "auto") {
+    return "1K";
+  }
+
+  if (
+    size === "1K" ||
+    size === "1024x1024" ||
+    size === "1024x1536" ||
+    size === "1536x1024"
+  ) {
+    return "1K";
+  }
+
+  if (
+    size === "2K" ||
+    size === "2048x2048" ||
+    size === "2048x3072" ||
+    size === "3072x2048"
+  ) {
+    return "2K";
+  }
+
+  if (
+    size === "4K" ||
+    size === "4096x4096" ||
+    size === "4096x6144" ||
+    size === "6144x4096"
+  ) {
+    return "4K";
+  }
+
+  return "1K";
 }
 
 function normalizeResult(result) {
@@ -156,7 +243,9 @@ function normalizeResult(result) {
 }
 
 function dataUrlToBlob(value) {
-  const match = /^data:([^;]+);base64,(.*)$/s.exec(String(value || ""));
+  const match = /^data:([^;]+);base64,(.*)$/s.exec(
+    String(value || ""),
+  );
 
   if (!match) {
     throw new Error("Reference image is not a valid dataURL");

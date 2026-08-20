@@ -71,7 +71,7 @@ module.exports = async function handler(req, res) {
 };
 
 async function createImage(baseUrl, apiKey, model, prompt, params) {
-  const isMediaApi = isMediaBaseUrl(baseUrl);
+  const isMediaApi = baseUrl.includes("/media");
 
   const payload = {
     model,
@@ -83,8 +83,6 @@ async function createImage(baseUrl, apiKey, model, prompt, params) {
   if (isMediaApi) {
     payload.size = normalizeMediaSize(params.size, model);
 
-    // gpt-image-2 的媒体规格要求 medium。
-    // 当前中转站 gpt-image-2 没有可用通道，但保留正确参数。
     if (model === "gpt-image-2") {
       payload.quality = "medium";
     }
@@ -116,7 +114,7 @@ async function createImageEdit(
   images,
   params,
 ) {
-  const isMediaApi = isMediaBaseUrl(baseUrl);
+  const isMediaApi = baseUrl.includes("/media");
   const form = new FormData();
 
   form.set("model", model);
@@ -160,10 +158,6 @@ async function createImageEdit(
   });
 }
 
-function isMediaBaseUrl(baseUrl) {
-  return /\/media$/i.test(baseUrl);
-}
-
 function normalizeCount(value) {
   const count = Number(value || 1);
 
@@ -175,16 +169,11 @@ function normalizeCount(value) {
 }
 
 function normalizeMediaSize(size, model) {
-  // 当前可用的 canvas-image-fast 只支持 1K。
   if (
     model === "canvas-image-fast" ||
-    model === "canvas-image-lite"
+    model === "canvas-image-lite" ||
+    model === "gpt-image-2"
   ) {
-    return "1K";
-  }
-
-  // gpt-image-2 当前媒体列表显示只支持 1K。
-  if (model === "gpt-image-2") {
     return "1K";
   }
 

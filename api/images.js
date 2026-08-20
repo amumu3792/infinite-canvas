@@ -52,6 +52,11 @@ module.exports = async function handler(req, res) {
       });
     }
 
+    // 媒体接口可能先返回 in_progress，需要继续查询任务状态。
+    if (isMediaApi(baseUrl) && isMediaJob(result)) {
+      result = await waitForMediaJob(baseUrl, apiKey, result);
+    }
+
     const data = normalizeResult(result);
 
     if (!data.length) {
@@ -61,8 +66,8 @@ module.exports = async function handler(req, res) {
       });
     }
 
-    // 媒体接口返回的是跨域资源 URL。
-    // 在服务端下载并转换成 data URL，避免浏览器 CORS 拦截。
+    // 媒体接口返回的图片 URL 可能被浏览器 CORS 拦截。
+    // 在 Vercel 服务端下载后转换成 data URL。
     const finalData = isMediaApi(baseUrl)
       ? await materializeImages(data)
       : data;
@@ -161,13 +166,106 @@ async function createImageEdit(
   });
 }
 
+function isMediaApi(baseUrl) {
+  return /\/media$/i.test(baseUrl);
+}
+
+function isMediaJob(result) {
+  return (
+    result &&
+    (
+      result.type === "media.job" ||
+      (
+        result.id &&
+        [
+          "queued",
+          "pending",
+          "in_progress",
+          "processing",
+        ].includes(result.status)
+      )
+    )
+  );
+}
+
+async function waitForMediaJob(baseUrl, apiKey, job) {
+  let current = job;
+
+  // 最多等待 60 秒，每 1.5 秒查询一次。
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    if (
+      [
+        "completed",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "expired",
+      ].includes(current.status)
+    ) {
+      break;
+    }
+
+    await sleep(1500);
+
+    const response = await fetch(
+      `${baseUrl}/v1/jobs/${encodeURIComponent(job.id)}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+      },
+    );
+
+    const text = await response.text();
+
+    if (!response.ok) {
+      throw new Error(
+        `Media job polling failed: ${response.status} ${text.slice(0, 500)}`,
+      );
+    }
+
+    try {
+      current = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `Media job polling returned invalid JSON: ${text.slice(0, 500)}`,
+      );
+    }
+  }
+
+  if (current.status === "failed") {
+    throw new Error(
+      current.error?.message || "Media image job failed",
+    );
+  }
+
+  if (current.status === "cancelled") {
+    throw new Error("Media image job was cancelled");
+  }
+
+  if (current.status === "expired") {
+    throw new Error("Media image job expired");
+  }
+
+  if (
+    !["completed", "succeeded"].includes(current.status)
+  ) {
+    throw new Error("Media image job timed out after 60 seconds");
+  }
+
+  return current;
+}
+
 async function materializeImages(items) {
   return Promise.all(
     items.map(async (item) => {
       if (typeof item === "string") {
-        return item.startsWith("data:")
-          ? item
-          : await downloadAsDataUrl(item);
+        if (item.startsWith("data:")) {
+          return item;
+        }
+
+        return downloadAsDataUrl(item);
       }
 
       if (item?.dataUrl) {
@@ -179,10 +277,12 @@ async function materializeImages(items) {
       }
 
       if (item?.url) {
-        return await downloadAsDataUrl(item.url);
+        return downloadAsDataUrl(item.url);
       }
 
-      throw new Error("Image item missing dataUrl/url/b64_json");
+      throw new Error(
+        "Image item missing dataUrl/url/b64_json",
+      );
     }),
   );
 }
@@ -202,10 +302,6 @@ async function downloadAsDataUrl(url) {
   const buffer = Buffer.from(await response.arrayBuffer());
 
   return `data:${contentType};base64,${buffer.toString("base64")}`;
-}
-
-function isMediaApi(baseUrl) {
-  return /\/media$/i.test(baseUrl);
 }
 
 function normalizeCount(value) {
@@ -274,6 +370,14 @@ function normalizeResult(result) {
     return result.data.data;
   }
 
+  if (Array.isArray(result?.outputs)) {
+    return result.outputs;
+  }
+
+  if (Array.isArray(result?.output)) {
+    return result.output;
+  }
+
   if (Array.isArray(result?.images)) {
     return result.images;
   }
@@ -287,10 +391,16 @@ function dataUrlToBlob(value) {
   );
 
   if (!match) {
-    throw new Error("Reference image is not a valid dataURL");
+    throw new Error(
+      "Reference image is not a valid dataURL",
+    );
   }
 
   return new Blob([Buffer.from(match[2], "base64")], {
     type: match[1] || "image/png",
   });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

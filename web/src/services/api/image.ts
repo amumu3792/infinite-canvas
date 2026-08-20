@@ -875,23 +875,39 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
     }
 }
 
-export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKey" | "apiFormat">) {
+export async function fetchImageModels(
+    config: Pick<AiConfig, "baseUrl" | "apiKey" | "apiFormat">,
+) {
     try {
         if (config.apiFormat === "gemini") {
-            const response = await axios.get<GeminiPayload>(geminiApiUrl({ ...defaultGeminiConfig, ...config }), { headers: geminiHeaders({ ...defaultGeminiConfig, ...config }) });
+            const response = await axios.get<GeminiPayload>(
+                geminiApiUrl({ ...defaultGeminiConfig, ...config }),
+                {
+                    headers: geminiHeaders({ ...defaultGeminiConfig, ...config }),
+                },
+            );
+
             validateGeminiPayload(response.data);
+
             return (response.data.models || [])
                 .map((model) => model.name?.replace(/^models\//, ""))
                 .filter((id): id is string => Boolean(id))
                 .sort((a, b) => a.localeCompare(b));
         }
-        const response = await axios.get<{ data?: Array<{ id?: string }>; error?: { message?: string } }>(buildApiUrl(config.baseUrl, "/models"), {
-            headers: {
-                Authorization: `Bearer ${config.apiKey}`,
-            },
+
+        const response = await axios.post("/api/models", {
+            baseUrl: config.baseUrl,
+            apiKey: config.apiKey,
         });
-        return (response.data.data || [])
-            .map((model) => model.id)
+
+        const models = Array.isArray(response.data?.data)
+            ? response.data.data
+            : [];
+
+        return models
+            .map((model: { id?: string } | string) =>
+                typeof model === "string" ? model : model.id,
+            )
             .filter((id): id is string => Boolean(id))
             .sort((a, b) => a.localeCompare(b));
     } catch (error) {
